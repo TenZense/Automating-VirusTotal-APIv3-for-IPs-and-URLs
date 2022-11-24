@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import time
 from pathlib import Path
 import requests
@@ -8,7 +9,9 @@ import json
 import base64
 import os
 import hashlib
+import math
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 
 # //////////////////////////////////////////////
@@ -25,7 +28,6 @@ from dotenv import load_dotenv
 #
 # //////////////////////////////////////////////
 
-
 # load_dotenv will look for a .env file and if it finds one it will load the environment variables from it
 load_dotenv()
 
@@ -36,36 +38,203 @@ and exposing your API key in the repository
 """
 
 # retrieve API key from .env file and store in a variable
-API_KEY = os.getenv("API_KEY1")
+API_KEY = os.getenv("VT_PUB_API_KEY")
 
+# retrieve User from .env file and store in a variable
+API_USER = os.getenv("VT_USER_ID")
 
-# ////////////////////////////////// START Initiate the parser
-
-parser = argparse.ArgumentParser(description="Python Automated VT API v3 IP address and URL analysis 2.0 by Brett Fullam")
-parser.add_argument("-s", "--single-entry", help="ip or url for analysis")
-parser.add_argument("-i", "--ip-list", help="bulk ip address analysis")
-parser.add_argument("-u", "--url-list", help="bulk url analysis")
-parser.add_argument("-V", "--version", help="show program version", action="store_true")
-
-# ////////////////////////////////// END Initiate the parser
-
+# API Key rate limits obtained from: https://www.virustotal.com/gui/my-apikey
+# --/ Public API rate limits
+# Request rate 	4 lookups / min
+# - Round up to ensure nothing weird happens and a rate limit isn't hit because of a rounded down value.
+requestRate = math.ceil(4 / 60)
+# Daily quota 	500 lookups / day
+# dailyQuota = 500
+# Monthly quota 15.50 K lookups / month
+# monthlyQuota = 15500
 
 # initialize dataframe variable
 dataframe = []
 
-report_time = ' '
+quotas = {}
+history = {
+    # Set a default time or face errors when starting a new history file.
+    'last_run': time.strftime("%Y-%m-%d %H:%M:%S%z", time.localtime(time.time())),
+    'historicIPs': {},
+    'historicURLs': {},
+}
+verbose = False
+report_time = " "
+
+
+def get_quotas():
+    """
+    Retrieves API quota values for a given user.
+    :return: Dictionary containing remainingHourlyQuota, remainingDailyQuota and remainingMonthlyQuota
+    """
+    url = "https://www.virustotal.com/api/v3/users/" + API_USER + "/overall_quotas"
+    # while you can enter your API key directly for the "x-apikey" it's not recommended as a "best practice" and should
+    # be stored-accessed separately in a .env file (see comment under "load_dotenv()"" for more information
+    headers = {"Accept": "application/json", "x-apikey": API_KEY}
+
+    # get quota info from VT
+    response = requests.request("GET", url, headers=headers)
+    # load returned json from virustotal into a python dictionary called json_response
+    json_response = json.loads(response.text)
+
+    api_requests_monthly_remaining = \
+        json_response['data']['api_requests_monthly']['user']['allowed'] - \
+        json_response['data']['api_requests_monthly']['user']['used']
+
+    api_requests_hourly_remaining = \
+        json_response['data']['api_requests_hourly']['user']['allowed'] - \
+        json_response['data']['api_requests_hourly']['user']['used']
+
+    api_requests_daily_remaining = \
+        json_response['data']['api_requests_daily']['user']['allowed'] - \
+        json_response['data']['api_requests_daily']['user']['used']
+
+    return {
+        'remainingHourlyQuota': api_requests_hourly_remaining,
+        'remainingDailyQuota': api_requests_daily_remaining,
+        'remainingMonthlyQuota': api_requests_monthly_remaining,
+    }
+
+
+def check_quotas():
+    """
+    Warns users about quota limits that have been reached and wait time.
+    :return: True if there is quota available to perform at least one check.
+    """
+    global quotas
+    global history
+    quotas = get_quotas()
+    if quotas['remainingMonthlyQuota'] > 0:
+        if quotas['remainingDailyQuota'] > 0:
+            if quotas['remainingHourlyQuota'] > 0:
+                return True
+            else:
+                wait_time = calculate_wait(timedelta(hours=1))
+                print(f"Hourly quota reached!\nWait {wait_time}, your last run was at, {history['last_run']}")
+                return False
+        else:
+            wait_time = calculate_wait(timedelta(days=1))
+            print(f"Daily quota reached!\nWait {wait_time}, your last run was at, {history['last_run']}")
+            return False
+    else:
+        wait_time = calculate_wait(timedelta(days=30))
+        print(f"Monthly quota reached!\nWait {wait_time}, your last run was at, {history['last_run']}")
+        return False
+
+
+def continue_validation(input_value):
+    if str(input_value).lower() == 'y' or input_value == '\r':
+        return True
+    elif str(input_value).lower() == 'n':
+        # User opted to Abort
+        print('KThanksBye :)')
+        exit()
+    else:
+        # Invalid option
+        print('Invalid option, exiting..')
+        exit(1)
+
+
+def check_history(historic_data, current_list):
+    """
+    Generates a list of IPs or URLs that have not previously been checked.
+    :param historic_data: Dictionary of historic addresses.
+    :param current_list: List of addresses.
+    :return: List of addresses
+    """
+    hit_list = []
+    for IPv4address in current_list:
+        if IPv4address not in historic_data:
+            hit_list.append(IPv4address)
+    return hit_list
+
+
+def validate_ipv4_addresses(ip_list):
+    """
+    Validates IP addresses creating two main lists of IPv4 addresses, namely PrivateIPs and PublicIPs.  IPv6 and poorly
+    formatted addresses are contained in IgnoredIPs.
+    :param ip_list: List containing IP address strings.
+    :return: Dictionary containing lists for PrivateIPs, PublicIPs and IgnoredIPs.
+    """
+    # initializing variables to store our sorted public, private and ignored IPs
+    private_ips = []
+    public_ips = []
+    ignored_ips = []
+
+    # iterate over each line of the user defined list using the regex pattern to IP addresses in the user defined list
+    for line in ip_list:
+        line = line.strip()
+        try:
+            # VT currently only handles IPv4 address space so restricting matched addresses and ensuring that the
+            # appended string is appropriately formatted.
+            if ipaddress.IPv4Address(line).is_private:
+                private_ips.append(format(ipaddress.IPv4Address(line)))
+            else:
+                public_ips.append(format(ipaddress.IPv4Address(line)))
+        # skip invalid IPs that are either IPv6 or incorrectly formatted.
+        except ValueError:
+            ignored_ips.append(line)
+    return {
+        'PrivateIPs': private_ips,
+        'PublicIPs': public_ips,
+        'IgnoredIPs': ignored_ips,
+    }
+
+
+def print_columns(items, columns=4):
+    """Print a list as multiple columns instead of just one."""
+    rows = []
+    items_per_column = int(len(items) / columns) + 1
+    for index, address in enumerate(items):
+        address = address.ljust(20)
+        if len(rows) < items_per_column:
+            rows.append(address)
+        else:
+            rows[index % items_per_column] += address
+    for row in rows:
+        print(row)
+
+
+def generate_json(data, out_file, human_readable=False):
+    with open(out_file, 'w') as json_file:
+        if human_readable:
+            # Human readable JSON export
+            json.dump(data, json_file, indent=4)
+        else:
+            # Non human readable export
+            json.dump(data, json_file)
+    return
+
+
+def calculate_wait(duration):
+    global history
+    historic_datetime = datetime.strptime(history['last_run'], "%Y-%m-%d %H:%M:%S%z")
+    time_delta = historic_datetime + duration - datetime.now(tz=historic_datetime.tzinfo).replace(microsecond=0)
+    return time_delta
+
+
+# begin function for encrypting our hyperlink string to sha256
+def encrypt_string(hash_string):
+    sha_signature = hashlib.sha256(hash_string.encode()).hexdigest()
+    return sha_signature
 
 
 # ////////////////////////////////// START URL REPORT REQUEST
+# this is the function that will take user input or input from a list to submit urls to VirusTotal for url reports,
+# receive and format the returned json for generating our html reports
 
-# this is the function that will take user input or input from a list to submit urls to VirusTotal for url reports, receive and format the returned json for generating our html reports
-
-def urlReport(arg):
+def url_report(arg):
 
     # user input, ip or url, to be submitted for a url analysis stored in the target_url variable
     target_url = arg
 
-    # For a url analysis report virustotal requires the "URL identifier" or base64 representation of URL to scan (w/o padding)
+    # For a url analysis report virustotal requires the "URL identifier" or base64 representation of URL to scan (w/o
+    # padding)
 
     # create virustotal "url identifier" from user input stored in target_url
     # Encode the user submitted url to base64 and strip the "==" from the end
@@ -76,12 +245,9 @@ def urlReport(arg):
     # amend the virustotal apiv3 url to include the unique generated url_id
     url = "https://www.virustotal.com/api/v3/urls/" + url_id
 
-
-    # while you can enter your API key directly for the "x-apikey" it's not recommended as a "best practice" and should be stored-accessed separately in a .env file (see comment under "load_dotenv()"" for more information
-    headers = {
-        "Accept": "application/json",
-        "x-apikey": API_KEY
-    }
+    # while you can enter your API key directly for the "x-apikey" it's not recommended as a "best practice" and should
+    # be stored-accessed separately in a .env file (see comment under "load_dotenv()"" for more information
+    headers = {"Accept": "application/json", "x-apikey": API_KEY}
 
     response = requests.request("GET", url, headers=headers)
 
@@ -91,55 +257,53 @@ def urlReport(arg):
     # grab the epoch timestamp at run time and convert to human-readable for the html report header information
     timeStamp = time.time()
 
-    # set report_time to a global value to share the stored value with other functions    
+    # set report_time to a global value to share the stored value with other functions
     global report_time
 
     # convert epoch timestamp to human-readable date time formatted
-    report_time = time.strftime('%c', time.localtime(timeStamp))
-    
+    report_time = time.strftime("%c", time.localtime(timeStamp))
+
     # set dataframe to a global value to share the stored value with other functions
     global dataframe
 
     # grab "last_analysis_date" key data to convert epoch timestamp to human readable date time formatted
-    epoch_time = (decodedResponse["data"]["attributes"]["last_analysis_date"])
-    
+    epoch_time = decodedResponse["data"]["attributes"]["last_analysis_date"]
+
     # convert epoch time to human readable date time and store in the time_formatted variable
-    # the original key last_analysis_date from the returned virustotal json will be removed and replaced with an updated last_analysis_date value that's now human readable
-    time_formatted = time.strftime('%c', time.localtime(epoch_time))
+    # the original key last_analysis_date from the returned virustotal json will be removed and replaced with an updated
+    # last_analysis_date value that's now human readable
+    time_formatted = time.strftime("%c", time.localtime(epoch_time))
 
-    # create sha256 encoded vt "id" of each url or ip address to generate a hypertext link to a virustotal report in each table
+    # create sha256 encoded vt "id" of each url or ip address to generate a hypertext link to a virustotal report in
+    # each table
     # create a string value of the complete url to be encoded
-    UrlId_unEncrypted = ("http://" + target_url + "/")
-
-    # begin function for encrypting our hyperlink string to sha256
-    def encrypt_string(hash_string):
-        sha_signature = \
-            hashlib.sha256(hash_string.encode()).hexdigest()
-        return sha_signature
+    UrlId_unEncrypted = "http://" + target_url + "/"
 
     # store the hyperlink string to be hashed in the variable hash_string
     hash_string = UrlId_unEncrypted
-    
+
     # encrypt and store our sha256 hashed hypertext string as
     sha_signature = encrypt_string(hash_string)
- 
+
     # create the hypertext link to the virustotal.com report
-    vt_urlReportLink = ("https://www.virustotal.com/gui/url/" + sha_signature)
+    vt_urlReportLink = "https://www.virustotal.com/gui/url/" + sha_signature
 
-    # strip the "data" and "attribute" keys from the decodedResponse dictionary and only include the keys listed within "attributes" to create a more concise list stored in a new dictionary called a_json
-    filteredResponse = (decodedResponse["data"]["attributes"])
+    # strip the "data" and "attribute" keys from the decodedResponse dictionary and only include the keys listed within
+    # "attributes" to create a more concise list stored in a new dictionary called a_json
+    filteredResponse = decodedResponse["data"]["attributes"]
 
-    # create an array of keys to be removed from attributes to focus on specific content for quicker/higher-level analysis
+    # create an array of keys to be removed from attributes to focus on specific content for quicker/higher-level
+    # analysis
     keys_to_remove = [
-        "last_http_response_content_sha256", 
+        "last_http_response_content_sha256",
         "last_http_response_code",
         "last_analysis_results",
-        "last_final_url", 
-        "last_http_response_content_length", 
-        "url", 
-        "last_analysis_date", 
-        "tags", 
-        "last_submission_date", 
+        "last_final_url",
+        "last_http_response_content_length",
+        "url",
+        "last_analysis_date",
+        "tags",
+        "last_submission_date",
         "threat_names",
         "last_http_response_headers",
         "categories",
@@ -153,40 +317,57 @@ def urlReport(arg):
         "links",
         "trackers",
         "last_http_response_cookies",
-        "html_meta"
-        ]
+        "html_meta",
+        "favicon",
+    ]
 
-    # iterate through the filteredResponse dictionary using the keys_to_remove array and pop to remove additional keys listed in the array
+    # iterate through the filteredResponse dictionary using the keys_to_remove array and pop to remove additional keys
+    # listed in the array
     for key in keys_to_remove:
-      filteredResponse.pop(key, None)
+        filteredResponse.pop(key, None)
 
     # create a dataframe with the remaining keys stored in the filteredResponse dictionary
     # orient="index" is necessary in order to list the index of attribute keys as rows and not as columns
     dataframe = pd.DataFrame.from_dict(filteredResponse, orient="index")
-    
+
     # rename the column header to the submitted url
     dataframe.columns = [target_url]
 
     # grab "malicious" key data from last_analysis_stats to create the first part of the community_score_info
-    community_score = (decodedResponse["data"]["attributes"]["last_analysis_stats"]["malicious"])
+    community_score = decodedResponse["data"]["attributes"]["last_analysis_stats"][
+        "malicious"
+    ]
 
-    # grab the sum of last_analysis_stats to create the total number of security vendors that reviewed the URL for the second half of the community_score_info
-    total_vt_reviewers = (decodedResponse["data"]["attributes"]["last_analysis_stats"]["harmless"])+(decodedResponse["data"]["attributes"]["last_analysis_stats"]["malicious"])+(decodedResponse["data"]["attributes"]["last_analysis_stats"]["suspicious"])+(decodedResponse["data"]["attributes"]["last_analysis_stats"]["undetected"])+(decodedResponse["data"]["attributes"]["last_analysis_stats"]["timeout"])
+    # grab the sum of last_analysis_stats to create the total number of security vendors that reviewed the URL for the
+    # second half of the community_score_info
+    total_vt_reviewers = (
+        (decodedResponse["data"]["attributes"]["last_analysis_stats"]["harmless"])
+        + (decodedResponse["data"]["attributes"]["last_analysis_stats"]["malicious"])
+        + (decodedResponse["data"]["attributes"]["last_analysis_stats"]["suspicious"])
+        + (decodedResponse["data"]["attributes"]["last_analysis_stats"]["undetected"])
+        + (decodedResponse["data"]["attributes"]["last_analysis_stats"]["timeout"])
+    )
 
     # create a custom community score using community_score and the total_vt_reviewers values
-    community_score_info = str(community_score)+ ("/") + str(total_vt_reviewers) + ("  :  security vendors flagged this as malicious")
+    community_score_info = (
+        str(community_score)
+        + ("/")
+        + str(total_vt_reviewers)
+        + ("  :  security vendors flagged this as malicious")
+    )
 
     # amend dataframe with extra community score row
-    dataframe.loc['virustotal report',:] = vt_urlReportLink
+    dataframe.loc["virustotal report", :] = vt_urlReportLink
 
     # amend dataframe with extra community score row
-    dataframe.loc['community score',:] = community_score_info
+    dataframe.loc["community score", :] = community_score_info
 
-    # amend dataframe with the updated last_analysis_date value stored in time_formatted that was converted from epoch to human readable
-    dataframe.loc['last_analysis_date',:] = time_formatted
+    # amend dataframe with the updated last_analysis_date value stored in time_formatted that was converted from epoch
+    # to human readable
+    dataframe.loc["last_analysis_date", :] = time_formatted
 
     # sort dataframe index in alphabetical order to put the community score at the top
-    dataframe.sort_index(inplace = True)
+    dataframe.sort_index(inplace=True)
 
     # set html to a global value to share the stored value with other functions
     global html
@@ -194,24 +375,29 @@ def urlReport(arg):
     # dataframe is output as an html table, and stored in the html variable
     html = dataframe.to_html(render_links=True, escape=False)
 
-# ////////////////////////////////// END URL REPORT REQUEST
 
+# ////////////////////////////////// END URL REPORT REQUEST
 
 
 # ////////////////////////////////// START IMPORT URL LIST
 
-# this function will handle importing a user defined list of urls, validate each url, and store them in an array called lst.  Then each validated entry will be submitted to the urlReport() function, and an html table will be returned for each of them and stored in an array called html_table_array. 
+# this function will handle importing a user defined list of urls, validate each url, and store them in an array called
+# lst.  Then each validated entry will be submitted to the urlReport() function, and an html table will be returned for
+# each of them and stored in an array called html_table_array.
 
-def urlReportLst(arg):
+
+def url_report_list(arg):
     print("Option 2:")
     # open user defined list from file path/name
     with open(arg) as fcontent:
         fstring = fcontent.readlines()
     # regex statement to validate/normalize the content of the user defined list
-    pattern = re.compile(r'(http:\/\/www\.|https:\/\/www\.|http:\/\/|https:\/\/)?[a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,5}(:[0-9]{1,5})?(\/.*)?')
+    pattern = re.compile(
+        r"(http:\/\/www\.|https:\/\/www\.|http:\/\/|https:\/\/)?[a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,5}(:[0-9]{1,5})?(\/.*)?"  # pylint: disable=line-too-long
+    )
 
     # initialize the lst array to store the validated list
-    lst=[]
+    lst = []
 
     # iterate over each line of the user defined list using the regex pattern to validate and normalize the content
     for line in fstring:
@@ -231,47 +417,57 @@ def urlReportLst(arg):
 
     # create and store an array of html tables using our validated list in html_table_array
     for i in lst:
-        urlReport(i)
-        # print(dataframe) is used to print output to the terminal to improve user experience within the terminal.  This can be commented out or removed completely if you do not want to see any output printed in the terminal for each validated entry.
+        url_report(i)
+        # print(dataframe) is used to print output to the terminal to improve user experience within the terminal.  This
+        # can be commented out or removed completely if you do not want to see any output printed in the terminal for
+        # each validated entry.
         print(dataframe, "\n")
         html_table_array.append(html)
 
-    # update html variable with our array of html tables stored in html_table_array for use with the outputHTML() function
+    # update html variable with our array of html tables stored in html_table_array for use with the outputHTML()
+    # function.
     html = html_table_array
+
 
 # ////////////////////////////////// END IMPORT URL LIST
 
 
-
 # ////////////////////////////////// START IMPORT IP LIST
 
-# this function will handle importing a user defined list of IPs, sort each IP as public or private IP range, and store them in separate arrays called Public_IPs or Private_IPs.  Then, since we are only interested in public IPs, only the IPs stored in the Public_IPs array will be validated and submitted to the urlReport() function.  An html table will be returned for each of the IPs and stored in an array called html_table_array. 
+# this function will handle importing a user defined list of IPs, sort each IP as public or private IP range, and store
+# them in separate arrays called Public_IPs or Private_IPs.  Then, since we are only interested in public IPs, only the
+# IPs stored in the Public_IPs array will be validated and submitted to the urlReport() function.  An html table will be
+# returned for each of the IPs and stored in an array called html_table_array.
 
-def urlReportIPLst(arg):
+
+def url_report_ip_list(arg):
     # open user defined list from file path/name
     print("Option 3:")
     with open(arg) as fh:
         string = fh.readlines()
 
-    # regex pattern to filter-sort Private and Public IP addresses
-    pattern = re.compile(r'(^0\.)|(^10\.)|(^100\.6[4-9]\.)|(^100\.[7-9]\d\.)|(^100\.1[0-1]\d\.)|(^100\.12[0-7]\.)|(^127\.)|(^169\.254\.)|(^172\.1[6-9]\.)|(^172\.2[0-9]\.)|(^172\.3[0-1]\.)|(^192\.0\.0\.)|(^192\.0\.2\.)|(^192\.88\.99\.)|(^192\.168\.)|(^198\.1[8-9]\.)|(^198\.51\.100\.)|(^203.0\.113\.)|(^22[4-9]\.)|(^23[0-9]\.)|(^24[0-9]\.)|(^25[0-5]\.)')
-
     # initializing variables to store our sorted public and private IPs
-    Private_IPs =[]
-    Public_IPs=[]
+    Private_IPs = []
+    Public_IPs = []
+
+    # initialize the sorted array values of invalid addresses
+    invalid_IPs = []
 
     # iterate over each line of the user defined list using the regex pattern to IP addresses in the user defined list
     for line in string:
         line = line.rstrip()
-        result = pattern.search(line)
-  
-        if result:
-            Private_IPs.append(line)
-    
-        else:
-            Public_IPs.append(line)
-    
-    
+        try:
+            # VT currently only handles IPv4 address space so restricting matched addresses and ensuring that the
+            # appended string is appropriately formatted.
+            if ipaddress.IPv4Address(line).is_private:
+                Private_IPs.append(format(ipaddress.IPv4Address(line)))
+
+            else:
+                Public_IPs.append(format(ipaddress.IPv4Address(line)))
+        # skip invalid IPs that are either IPv6 or incorrectly formatted.
+        except ValueError:
+            invalid_IPs.append(line)
+
     """
     # Un-comment this to display the sorted raw Private and Public IP addresses found in the imported list for debugging
 
@@ -281,45 +477,28 @@ def urlReportIPLst(arg):
     #print(Public_IPs)
 
     """
-    
-    # regex pattern to further filter-sort valid Public IP addresses
-    pattern2 =re.compile(r'(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])')
-    
-    # initialized the sorted array values
-    valid2 =[]
-    invalid2=[]
-
-    # loop through the arrays to filter-sort valid and invalid public ip addresses
-    for i in Public_IPs:
-        i = i.rstrip()
-        result = pattern2.search(i)
-        
-        if result:
-            valid2.append(i)
-        else:
-            invalid2.append(i)
 
     # displaying the sorted valid IP addresses prior to running the reverse dns lookup
     print("Valid Public IPs")
-    print(valid2, "\n")
+    print(Public_IPs, "\n")
 
     """
     # Un-comment this to display invalid ip addresses for debugging
     print("Invalid IPs")
-    print(invalid2)
+    print(invalid_IPs)
     """
 
     # set dataframe to a global value to share the stored value with other functions
     global dataframe
     # set html to a global value to share the stored value with other functions
     global html
-    
+
     # initialize array to store our array of html tables
     html_table_array = []
 
     # create an array of html tables in html_table_array
-    for i in valid2:
-        urlReport(i)
+    for i in Public_IPs:
+        url_report(i)
         # print(dataframe) is used to print output to the terminal to improve user experience within the terminal.  This can be commented out or removed completely if you do not want to see any output printed in the terminal for each validated entry.
         print(dataframe, "\n")
         html_table_array.append(html)
@@ -327,15 +506,17 @@ def urlReportIPLst(arg):
     # update html variable with our array of html tables stored in html_table_array for use with the outputHTML() function
     html = html_table_array
 
-# ////////////////////////////////// END IMPORT IP LIST
 
+# ////////////////////////////////// END IMPORT IP LIST
 
 
 # ////////////////////////////////// START OUTPUT TO HTML
 
-# this function will take either a single html table or an array of html tables, and write them to a CSS styled html file called "report.html"
+# this function will take either a single html table or an array of html tables, and write them to a CSS styled html
+# file called "report.html"
 
-def outputHTML():
+
+def output_html():
 
     # save html with css styled boilerplated code up to the first <body> tag to a variable named "header"
     header = """<!DOCTYPE html>
@@ -417,24 +598,24 @@ def outputHTML():
         </html>
     """
     # create and open the new report.html file
-    text_file = open("report.html", "w")
+    text_file = open("report_" + report_time + ".html", "w")
     text_file.write(header)
     text_file.close()
 
     # open and append report.html with the human-readable date time stored in the report_timestamp variable
-    text_file = open("report.html", "a") # append mode
+    text_file = open("report_" + report_time + ".html", "a")  # append mode
     text_file.write(report_timestamp)
     text_file.close()
 
     # open and append report.html with a single html table from urlReport(), or as an array of html tables returned by urlReportLst or urlReportIPLst
-    text_file = open("report.html", "a") # append mode
+    text_file = open("report_" + report_time + ".html", "a")  # append mode
     # iterate through the html array and write all the html tables to report.html
     for x in html:
         text_file.write(x)
     text_file.close()
 
     # open and append report.html with the closing tags stored in the footer variable
-    text_file = open("report.html", "a") # append mode
+    text_file = open("report_" + report_time + ".html", "a")  # append mode
     text_file.write(footer)
     text_file.close()
 
@@ -442,31 +623,115 @@ def outputHTML():
 # ////////////////////////////////// END OUTPUT TO HTML
 
 
+if __name__ == "__main__":
+    # ////////////////////////////////// START Initiate the parser
 
+    parser = argparse.ArgumentParser(
+        description="Python Automated VT API v3 IP address and URL analysis 2.0 by Brett Fullam"
+    )
+    parser.add_argument("-s", "--single-entry", help="ip or url for analysis")
+    parser.add_argument("-i", "--ip-list", help="bulk ip address analysis")
+    parser.add_argument("-u", "--url-list", help="bulk url analysis")
+    parser.add_argument("-r", "--rate-limit", help="enable rate limiting when using a public API key.", default=False,
+                        action="store_true")
+    parser.add_argument("-v", "--verbose", help="enable verbose output.", default=False, action="store_true")
+    parser.add_argument("-V", "--version", help="show program version", action="store_true")
 
-# ////////////////////////////////// START Read arguments from the command line
+    # ////////////////////////////////// END Initiate the parser
 
-args = parser.parse_args()
+    # ////////////////////////////////// START Read arguments from the command line
 
+    args = parser.parse_args()
 
-# Check for --single-entry or -s
-if args.single_entry:
-    urlReport(args.single_entry)
-    print(dataframe)
-    outputHTML()
-# Check for --ip-list or -i
-elif args.ip_list:
-    urlReportIPLst(args.ip_list)
-    outputHTML()
-# Check for --url-list or -u
-elif args.url_list:
-    urlReportLst(args.url_list)
-    outputHTML()
-# Check for --version or -V
-elif args.version:
-    print("VT API v3 IP address and URL analysis 2.0")
-# Print usage information if no arguments are provided
-else:
-    print("usage: vt-ip-url-analysis.py [-h] [-s SINGLE_ENTRY] [-i IP_LIST] [-u URL_LIST] [-V]")
+    if args.version:
+        print("VT API v3 IP address and URL analysis 2.0")
+        exit(0)
 
-# ////////////////////////////////// END Read arguments from the command line
+    # Location of the history file
+    history_file_path = os.path.abspath(os.path.join(os.getcwd(), 'history.json'))
+    if os.path.isfile(history_file_path):
+        try:
+            with open(history_file_path, 'rb') as history_file:
+                history = json.loads(history_file.read())
+        except json.decoder.JSONDecodeError:
+            # file corrupt?  Use default and start over
+            pass
+
+    # Enable rate limiting
+    rate_limit = args.rate_limit
+    if rate_limit:
+        if args.ip_list:
+            if check_quotas():
+                with open(args.ip_list) as fh:
+                    lines = fh.readlines()
+                # validate the addresses and provide back the public addresses that we are interested in.
+                Processed_IPs = validate_ipv4_addresses(lines)
+
+                new_addresses = check_history(history['historicIPs'], Processed_IPs['PublicIPs'])
+                # If verbose output is enabled print out the private and ingnored addresses
+                if args.verbose:
+                    term_col, term_row = os.get_terminal_size()
+                    column_count = int(term_col / 20) - 1
+                    if len(Processed_IPs['PrivateIPs']) > 0:
+                        print("\nPrivate IPv4 Addresses:")
+                        print_columns(sorted(Processed_IPs['PrivateIPs']), column_count)
+                    if len(Processed_IPs['IgnoredIPs']) > 0:
+                        print(f"\nIgnored Addresses:")
+                        print_columns(sorted(Processed_IPs['IgnoredIPs']), column_count)
+
+                if len(new_addresses) > quotas['remainingMonthlyQuota']:
+                    continue_validation(input(
+                        "List exceeds Monthly quota, are you sure you want to continue? Y/n: "
+                    ))
+                if len(new_addresses) > quotas['remainingDailyQuota']:
+                    continue_validation(input(
+                        "List exceeds Daily quota, are you sure you want to continue?   Y/n: "
+                    ))
+                if len(new_addresses) > quotas['remainingHourlyQuota']:
+                    continue_validation(input(
+                        "List exceeds Hourly quota, are you sure you want to continue?  Y/n: "
+                    ))
+            else:
+                # Not enough credits, Abort
+                print('Insufficient quota.')
+                exit(1)
+
+            # Process what is available in the hourly limit
+            job_list = new_addresses[:quotas['remainingHourlyQuota']]
+            print(f"New addresses to process: {len(job_list)}")
+            # TODO add processing function
+
+            # Get international timestamp for tracking results
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S%z", time.localtime(time.time()))
+            # Update the history file
+            for address in job_list:
+                history['historicIPs'][address] = {
+                    'date_checked': timestamp,
+                    # TODO replace timestamp with report_time
+                    'report_file': "report_" + timestamp + ".html",
+                }
+            # Update last run timestamp
+            history['last_run'] = timestamp
+            generate_json(history, history_file_path, True)
+    exit()
+
+    # Check for --single-entry or -s
+    if args.single_entry:
+        url_report(args.single_entry)
+        print(dataframe)
+        output_html()
+    # Check for --ip-list or -i
+    elif args.ip_list:
+        url_report_ip_list(args.ip_list)
+        output_html()
+    # Check for --url-list or -u
+    elif args.url_list:
+        url_report_list(args.url_list)
+        output_html()
+    # Print usage information if no arguments are provided
+    else:
+        print(
+            "usage: vt-ip-url-analysis.py [-h] [-s SINGLE_ENTRY] [-i IP_LIST] [-u URL_LIST] [-V]"
+        )
+
+    # ////////////////////////////////// END Read arguments from the command line
